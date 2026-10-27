@@ -17,7 +17,7 @@ at a fixed commit, with HakiOS's changes on top, and the platform of each phone 
 |---|---|
 | `BootShim/BootShim.S` | copies the `XNUP` container behind the UEFI image to `0xF0000000`, where the loader finds the kernel |
 | `BootManagerLib` | starts the XNU loader from that container (`XnuLoader.c`) instead of showing a boot menu |
-| `BootLogo.bmp`, `NoBootOS.bmp`, `MassStorage.bmp` | HakiOS's emblem and name in place of Silicium's: what the phone shows while it starts is ours, every time |
+| `BootLogo.bmp`, `NoBootOS.bmp`, `MassStorage.bmp` | the site's mark (a lowercase h and the red dot) white on black, in place of Silicium's: what the phone shows while it starts is ours, every time |
 | `PcdFirmwareVendor` | `HakiOS` (what the firmware and its SMBIOS tables say they are) |
 | `Sec.c` | the first log line: `HakiOS UEFI (Mu-Silicium) for <maker> <model>` |
 
@@ -29,8 +29,8 @@ Mu-Silicium's own code keeps its licence and its authors' notices; this is a for
 python3 uefi/branding/banner.py /tmp/banner     # BootLogo.bmp, NoBootOS.bmp, MassStorage.bmp
 ```
 
-They are drawn from a few shapes and a 5x7 pixel font (the emblem is the website's logo, the wordmark HAKI in paper and OS in red),
-as 8-bit BMPs with a 256-colour palette, the format and sizes Silicium's are (300x300, 300x300, 500x500). Nothing to install; change
+They are the website's mark (hakios-web: a lowercase h and a red dot) white on black, drawn from its shapes and smoothed, with a
+5x7 pixel font for the two captions, as 8-bit BMPs with a 256-colour palette (greys and reds), the format and sizes Silicium's are (300x300, 300x300, 500x500). Nothing to install; change
 the text or the colours in the file and run `uefi/apply.sh` again.
 
 ## Make the tree
