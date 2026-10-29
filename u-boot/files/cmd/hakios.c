@@ -70,7 +70,7 @@ static int abl_ramdisk(ulong *start, ulong *size)
 	int node;
 
 	if (!fdt || fdt_check_header(fdt)) {
-		printf("hakios: no device tree from the bootloader before U-Boot\n");
+		printf("[oosexgang] hakios: no device tree from the bootloader before U-Boot\n");
 		return -ENOENT;
 	}
 	node = fdt_path_offset(fdt, "/chosen");
@@ -83,7 +83,7 @@ static int abl_ramdisk(ulong *start, ulong *size)
 	if (!hi)
 		hi = fdtdec_get_uint(fdt, node, "linux,initrd-end", 0);
 	if (!lo || hi <= lo) {
-		printf("hakios: the boot image has no ramdisk\n");
+		printf("[oosexgang] hakios: the boot image has no ramdisk\n");
 		return -ENOENT;
 	}
 	*start = lo;
@@ -94,13 +94,13 @@ static int abl_ramdisk(ulong *start, ulong *size)
 static int take_loader(const void *data, ulong size)
 {
 	if (size < 2 || memcmp(data, "MZ", 2)) {
-		printf("hakios: not a UEFI application\n");
+		printf("[oosexgang] hakios: not a UEFI application\n");
 		return -EINVAL;
 	}
 	if (size > loader_room) {
 		loader_room = ALIGN(size, SZ_64K);
 		if (lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_64K, &loader_addr, loader_room, LMB_NONE)) {
-			printf("hakios: no memory for a loader of %lu bytes\n", size);
+			printf("[oosexgang] hakios: no memory for a loader of %lu bytes\n", size);
 			loader_addr = 0;
 			loader_room = loader_size = 0;
 			return -ENOMEM;
@@ -110,7 +110,7 @@ static int take_loader(const void *data, ulong size)
 	loader_size = size;
 	env_set_hex("hakios_loader", loader_addr);
 	env_set_hex("hakios_loader_size", size);
-	printf("hakios: loader of %lu bytes at %#llx\n", size, (unsigned long long)loader_addr);
+	printf("[oosexgang] hakios: loader of %lu bytes at %#llx\n", size, (unsigned long long)loader_addr);
 	return 0;
 }
 
@@ -140,12 +140,12 @@ static int take_payload(const void *data, ulong size)
 	phys_addr_t addr = PAYLOAD_BASE;
 
 	if (size < 8 || head[0] != XNUP_MAGIC || head[1] > size - 8) {
-		printf("hakios: not an XNUP payload\n");
+		printf("[oosexgang] hakios: not an XNUP payload\n");
 		return -EINVAL;
 	}
 	size = head[1] + 8;
 	if (size > PAYLOAD_MAX) {
-		printf("hakios: payload of %lu bytes is over %u\n", size, PAYLOAD_MAX);
+		printf("[oosexgang] hakios: payload of %lu bytes is over %u\n", size, PAYLOAD_MAX);
 		return -E2BIG;
 	}
 	/*
@@ -157,7 +157,7 @@ static int take_payload(const void *data, ulong size)
 	/* the loader runs with its own view of the caches (and the kernel with the MMU off at first) */
 	flush_dcache_range(PAYLOAD_BASE, PAYLOAD_BASE + ALIGN(size, ARCH_DMA_MINALIGN));
 	payload_size = size;
-	printf("hakios: payload of %lu bytes at %#lx\n", size, PAYLOAD_BASE);
+	printf("[oosexgang] hakios: payload of %lu bytes at %#lx\n", size, PAYLOAD_BASE);
 	/* a payload that carries its loader needs no other; one that does not keeps the loader there was */
 	take_loader_from_payload(data, size);
 	return 0;
@@ -171,7 +171,7 @@ static int take_container(const u8 *data, ulong size)
 
 	if (h->version != HKUB_VERSION || h->count > 16 ||
 	    h->header_size < sizeof(*h) + h->count * sizeof(*e) || h->header_size > size) {
-		printf("hakios: HKUB container version %u that this U-Boot does not read\n", h->version);
+		printf("[oosexgang] hakios: HKUB container version %u that this U-Boot does not read\n", h->version);
 		return -EINVAL;
 	}
 	for (u32 i = 0; i < h->count && !ret; i++, e++) {
@@ -181,12 +181,12 @@ static int take_container(const u8 *data, ulong size)
 		memcpy(name, e->name, sizeof(e->name));
 		name[sizeof(e->name)] = 0;
 		if (e->offset > size || e->size > size - e->offset) {
-			printf("hakios: %s runs past the end of the container\n", name);
+			printf("[oosexgang] hakios: %s runs past the end of the container\n", name);
 			return -EINVAL;
 		}
 		/* ABL's ramdisk sits in memory U-Boot may have used since: a damaged entry is never started */
 		if (crc32(0, p, e->size) != e->crc32) {
-			printf("hakios: %s is damaged (crc32 %08x, should be %08x)\n", name, crc32(0, p, e->size), e->crc32);
+			printf("[oosexgang] hakios: %s is damaged (crc32 %08x, should be %08x)\n", name, crc32(0, p, e->size), e->crc32);
 			return -EIO;
 		}
 		if (!strcmp(name, "loader"))
@@ -194,7 +194,7 @@ static int take_container(const u8 *data, ulong size)
 		else if (!strcmp(name, "payload"))
 			ret = take_payload(p, e->size);
 		else
-			printf("hakios: %s skipped\n", name);
+			printf("[oosexgang] hakios: %s skipped\n", name);
 	}
 	return ret;
 }
@@ -230,7 +230,7 @@ static int do_hakios_load(struct cmd_tbl *cmdtp, int flag, int argc, char *const
 		addr = env_get_hex("fastboot_addr_r", 0);
 		size = env_get_hex("filesize", 0);
 		if (!addr || !size) {
-			printf("hakios: nothing received over fastboot\n");
+			printf("[oosexgang] hakios: nothing received over fastboot\n");
 			return CMD_RET_FAILURE;
 		}
 	} else if (argc == 2) {
@@ -238,7 +238,7 @@ static int do_hakios_load(struct cmd_tbl *cmdtp, int flag, int argc, char *const
 		addr = hextoul(argv[1], NULL);
 		size = known_size(map_sysmem(addr, 0));
 		if (!size) {
-			printf("hakios: no HKUB container or XNUP payload at %#lx to take the size from\n", addr);
+			printf("[oosexgang] hakios: no HKUB container or XNUP payload at %#lx to take the size from\n", addr);
 			return CMD_RET_USAGE;
 		}
 	} else if (abl_ramdisk(&addr, &size)) {
@@ -254,7 +254,7 @@ static int do_hakios_load(struct cmd_tbl *cmdtp, int flag, int argc, char *const
 		return take_payload(data, size) ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	if (!memcmp(data, "MZ", 2))
 		return take_loader(data, size) ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
-	printf("hakios: nothing known at %#lx (%08x): an HKUB container, an XNUP payload or loader.efi\n", addr, magic);
+	printf("[oosexgang] hakios: nothing known at %#lx (%08x): an HKUB container, an XNUP payload or loader.efi\n", addr, magic);
 	return CMD_RET_FAILURE;
 }
 
@@ -263,11 +263,11 @@ static int do_hakios_boot(struct cmd_tbl *cmdtp, int flag, int argc, char *const
 	char cmd[64];
 
 	if (!loader_size) {
-		printf("hakios: no loader in memory (hakios load first)\n");
+		printf("[oosexgang] hakios: no loader in memory (hakios load first)\n");
 		return CMD_RET_FAILURE;
 	}
 	if (*(const u32 *)map_sysmem(PAYLOAD_BASE, 4) != XNUP_MAGIC)
-		printf("hakios: no payload at %#lx: the loader looks for one on its volume\n", PAYLOAD_BASE);
+		printf("[oosexgang] hakios: no payload at %#lx: the loader looks for one on its volume\n", PAYLOAD_BASE);
 	snprintf(cmd, sizeof(cmd), "bootefi %llx:%lx", (unsigned long long)loader_addr, loader_size);
 	return run_command(cmd, 0) ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
 }

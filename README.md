@@ -37,6 +37,8 @@ runs and what has been checked.
 | HakiOS's changes to U-Boot's files (Kconfig, Makefiles, the EFI setup) | `u-boot/hakios.patch` |
 | the hakios command: the loader and its payload from ABL's ramdisk or U-Boot's fastboot, the payload to `0xF0000000`, `bootefi` | `u-boot/files/cmd/hakios.c` |
 | Qualcomm's `EFI_USB_DEVICE_PROTOCOL` on U-Boot's USB gadget stack: the loader's own fastboot (`xl`) under U-Boot | `u-boot/files/lib/efi_loader/efi_qcom_usb.c` |
+| what the host does, on the phone's screen, each line marked `[oosexgang]` (`hakios_status=0` turns it off) | `efi_qcom_usb.c`, `cmd/hakios.c` |
+| U-Boot's DWC3 and fastboot fixed for this: bulk transfers start on queue, a stall is cleared with no transfer started, a response is dequeued only in flight | `u-boot/hakios.patch` |
 
 ```sh
 uefi/u-boot/apply.sh             # u-boot/ at the top: BASE, hakios.patch, files/, every device's U-Boot files

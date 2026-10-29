@@ -22,6 +22,8 @@
 #include <efi_loader.h>
 #include <env.h>
 #include <log.h>
+#include <time.h>
+#include <vsprintf.h>
 #include <malloc.h>
 #include <asm/unaligned.h>
 #include <linux/sizes.h>
@@ -126,6 +128,89 @@ static struct {
 
 #define qdbg(fmt, ...) do { if (qusb.debug) printf("qusb: " fmt, ##__VA_ARGS__); } while (0)
 
+/*
+ * What the host does over fastboot, on the screen: every command but the getvar polls, each download and upload with
+ * its size, progress and speed, and every FAIL. Marked [oosexgang]; hakios_status=0 turns it off.
+ */
+#define STATUS "[oosexgang] "
+
+static struct {
+	bool on;
+	bool download;			/* the last command was download: its DATA starts a receive */
+	u64 total, got, next;		/* the data phase in progress (total 0: none) */
+	bool in;			/* ... to the host */
+	ulong start;
+} fbs;
+
+static void fbs_begin(u64 total, bool in)
+{
+	fbs.total = total;
+	fbs.got = 0;
+	fbs.next = total / 4;
+	fbs.in = in;
+	fbs.start = get_timer(0);
+	printf(STATUS "%s %llu KiB\n", in ? "sending" : "receiving", total >> 10);
+}
+
+static void fbs_data(u64 n)
+{
+	ulong ms;
+
+	fbs.got += n;
+	if (fbs.got < fbs.total) {
+		if (fbs.got >= fbs.next && fbs.total >= SZ_1M) {
+			printf(STATUS "  %llu%%\n", fbs.got * 100 / fbs.total);
+			fbs.next += fbs.total / 4;
+		}
+		return;
+	}
+	ms = max(get_timer(fbs.start), 1UL);
+	printf(STATUS "%s %llu KiB in %lu ms (%llu KiB/s)\n", fbs.in ? "sent" : "received", fbs.total >> 10, ms,
+	       (fbs.total >> 10) * 1000 / ms);
+	fbs.total = 0;
+}
+
+/* what the host sent: a command, or a part of a download */
+static void fbs_out(const u8 *data, u64 n)
+{
+	char cmd[64];
+	u64 len = min_t(u64, n, sizeof(cmd) - 1);
+
+	if (!fbs.on || !n)
+		return;
+	if (fbs.total && !fbs.in) {
+		fbs_data(n);
+		return;
+	}
+	for (u64 i = 0; i < len; i++)
+		cmd[i] = data[i] >= 0x20 && data[i] < 0x7f ? data[i] : '.';
+	cmd[len] = 0;
+	fbs.download = !strncmp(cmd, "download:", 9);
+	if (strncmp(cmd, "getvar:", 7))
+		printf(STATUS "host: %s\n", cmd);
+}
+
+/* what goes to the host, as it is sent: an upload's data, or an answer (DATA starts a data phase, FAIL is said) */
+static void fbs_in(const u8 *data, u64 n)
+{
+	if (!fbs.on || !n)
+		return;
+	if (fbs.total && fbs.in) {
+		fbs_data(n);
+		return;
+	}
+	if (n >= 12 && !memcmp(data, "DATA", 4)) {
+		char hex[9];
+
+		memcpy(hex, data + 4, 8);
+		hex[8] = 0;
+		fbs_begin(simple_strtoull(hex, NULL, 16), !fbs.download);
+		fbs.download = false;
+	} else if (n >= 4 && !memcmp(data, "FAIL", 4)) {
+		printf(STATUS "loader: %.*s\n", (int)min_t(u64, n, 60), data);
+	}
+}
+
 static void qusb_event(u32 msg, const union efi_qcom_usb_event_data *data)
 {
 	unsigned int next = (qusb.ev_tail + 1) % MAX_EVENTS;
@@ -178,6 +263,8 @@ static void qusb_complete(struct usb_ep *ep, struct usb_request *req)
 			got = e->want;
 		if (req->buf != e->user && !req->status)
 			memcpy(e->user, req->buf, got);
+		if (!req->status)
+			fbs_out(req->buf, got);
 	}
 	data.transfer.status = req->status == -ESHUTDOWN || req->status == -ECONNRESET ?
 			       USB_DEVICE_TRANSFER_STATUS_CANCELLED :
@@ -226,7 +313,14 @@ static int qusb_take_config(void)
 			log_err("qcom usb: no endpoint for %02x\n", e->address);
 			return -ENODEV;
 		}
-		qdbg("endpoint %02x is %s (%02x)\n", e->address, e->ep->name, e->desc.bEndpointAddress);
+		/*
+		 * and the caller's packet size: autoconfig writes a full-speed one (64 bytes for bulk) for gadgets that
+		 * keep their high-speed descriptors apart. The controller took 64 while the host was told 512, and every
+		 * packet longer than 64 bytes was refused (seen on the phone: commands went, downloads did not).
+		 */
+		e->desc.wMaxPacketSize = d->wMaxPacketSize;
+		qdbg("endpoint %02x is %s (%02x, %u bytes)\n", e->address, e->ep->name, e->desc.bEndpointAddress,
+		     le16_to_cpu(e->desc.wMaxPacketSize));
 		/* what the host is told is the endpoint the controller really has */
 		d->bEndpointAddress = e->desc.bEndpointAddress;
 		e->ep->driver_data = e;
@@ -250,6 +344,9 @@ static void qusb_disable(void)
 	}
 	if (qusb.configured) {
 		qusb.configured = false;
+		if (fbs.on)
+			printf(STATUS "usb: the host is gone\n");
+		fbs.total = 0;
 		qusb_state(USB_DEVICE_STATE_DISCONNECTED);
 	}
 }
@@ -272,6 +369,8 @@ static int qusb_set_config(u16 value)
 		}
 	}
 	qusb.configured = true;
+	if (fbs.on)
+		printf(STATUS "usb: the host is connected\n");
 	qusb_state(USB_DEVICE_STATE_CONNECTED);
 	return 0;
 }
@@ -417,6 +516,9 @@ static efi_status_t EFIAPI qusb_start_ex(struct efi_qcom_usb_descriptor_set *set
 		return EFI_EXIT(EFI_ALREADY_STARTED);
 	qusb.set = *set;
 	qusb.debug = env_get_yesno("hakios_usb_debug") == 1;
+	fbs.on = env_get_yesno("hakios_status") != 0;
+	if (fbs.on)
+		printf(STATUS "usb: up, waiting for the host\n");
 	qusb.ev_head = qusb.ev_tail = 0;
 	ret = udc_device_get_by_index(0, &qusb.udc);
 	if (ret) {
@@ -480,6 +582,8 @@ static efi_status_t EFIAPI qusb_send(u8 endpoint, u64 size, void *buffer)
 		if (endpoint & USB_DIR_IN)
 			memcpy(req->buf, buffer, size);
 	}
+	if (endpoint & USB_DIR_IN)
+		fbs_in(buffer, size);
 	req->length = length;
 	req->zero = 0;
 	e->user = buffer;
