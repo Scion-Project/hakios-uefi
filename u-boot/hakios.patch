@@ -1,0 +1,142 @@
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+index c71c6824..02ed027c 100644
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -475,6 +475,14 @@ config BOOTM_VXWORKS
+ 	help
+ 	  Support booting VxWorks images via the bootm command.
+ 
++config CMD_HAKIOS
++	bool "hakios: start the HakiOS loader from memory"
++	depends on CMD_BOOTEFI && LMB
++	help
++	  Take the HakiOS loader (loader.efi) and its XNUP payload from the
++	  ramdisk the previous bootloader loaded, or from anywhere in RAM, put
++	  the payload where the loader looks for it and start the loader.
++
+ config CMD_BOOTEFI
+ 	bool "bootefi"
+ 	depends on EFI_LOADER
+diff --git a/cmd/Makefile b/cmd/Makefile
+index bbbdfcc4..3b9ad787 100644
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -35,6 +35,7 @@ obj-$(CONFIG_CMD_BLOCK_CACHE) += blkcache.o
+ obj-$(CONFIG_CMD_BMP) += bmp.o
+ obj-$(CONFIG_CMD_BOOTCOUNT) += bootcount.o
+ obj-$(CONFIG_CMD_BOOTEFI) += bootefi.o
++obj-$(CONFIG_CMD_HAKIOS) += hakios.o
+ obj-$(CONFIG_CMD_BOOTMENU) += bootmenu.o
+ obj-$(CONFIG_CMD_BOOTSTAGE) += bootstage.o
+ obj-$(CONFIG_CMD_BOOTZ) += bootz.o
+diff --git a/drivers/usb/gadget/f_fastboot.c b/drivers/usb/gadget/f_fastboot.c
+index 8df0e3f3..54b1afb1 100644
+--- a/drivers/usb/gadget/f_fastboot.c
++++ b/drivers/usb/gadget/f_fastboot.c
+@@ -398,7 +398,12 @@ static int fastboot_add(struct usb_configuration *c)
+ }
+ DECLARE_GADGET_BIND_CALLBACK(usb_dnl_fastboot, fastboot_add);
+ 
+-static int fastboot_tx_write(const char *buffer, unsigned int buffer_size)
++/*
++ * @in_flight: the IN request may still be queued (a response that overtakes the last one). From the request's own
++ * completion it is not: a dequeue there makes DWC3 print an error, which "oem console" then sends as the next line,
++ * which completes with another error, and so on for ever.
++ */
++static int __fastboot_tx_write(const char *buffer, unsigned int buffer_size, bool in_flight)
+ {
+ 	struct usb_request *in_req = fastboot_func->in_req;
+ 	int ret;
+@@ -406,7 +411,8 @@ static int fastboot_tx_write(const char *buffer, unsigned int buffer_size)
+ 	memcpy(in_req->buf, buffer, buffer_size);
+ 	in_req->length = buffer_size;
+ 
+-	usb_ep_dequeue(fastboot_func->in_ep, in_req);
++	if (in_flight)
++		usb_ep_dequeue(fastboot_func->in_ep, in_req);
+ 
+ 	ret = usb_ep_queue(fastboot_func->in_ep, in_req, 0);
+ 	if (ret)
+@@ -414,6 +420,11 @@ static int fastboot_tx_write(const char *buffer, unsigned int buffer_size)
+ 	return 0;
+ }
+ 
++static int fastboot_tx_write(const char *buffer, unsigned int buffer_size)
++{
++	return __fastboot_tx_write(buffer, buffer_size, true);
++}
++
+ static int fastboot_tx_write_str(const char *buffer)
+ {
+ 	return fastboot_tx_write(buffer, strlen(buffer));
+@@ -506,7 +517,7 @@ static void multiresponse_on_complete(struct usb_ep *ep, struct usb_request *req
+ 
+ 	/* Call handler to obtain next response */
+ 	fastboot_multiresponse(multiresponse_cmd, response);
+-	fastboot_tx_write_str(response);
++	__fastboot_tx_write(response, strlen(response), false);
+ 
+ 	/* If response is final OKAY/FAIL response disconnect this handler and unset cmd */
+ 	if (!strncmp("OKAY", response, 4) || !strncmp("FAIL", response, 4)) {
+diff --git a/include/efi_loader.h b/include/efi_loader.h
+index 3a4d5026..0e78ad20 100644
+--- a/include/efi_loader.h
++++ b/include/efi_loader.h
+@@ -671,6 +671,8 @@ efi_status_t efi_console_register(void);
+ efi_status_t efi_disks_register(void);
+ /* Called by efi_init_obj_list() to install EFI_RNG_PROTOCOL */
+ efi_status_t efi_rng_register(void);
++/* Called by efi_init_obj_list() to install Qualcomm's EFI_USB_DEVICE_PROTOCOL */
++efi_status_t efi_qcom_usb_register(void);
+ /* Called by efi_init_obj_list() to install EFI_TCG2_PROTOCOL */
+ efi_status_t efi_tcg2_register(void);
+ /* Called by efi_init_obj_list() to install RISCV_EFI_BOOT_PROTOCOL */
+diff --git a/lib/efi_loader/Kconfig b/lib/efi_loader/Kconfig
+index 4cb13ae7..9f794da0 100644
+--- a/lib/efi_loader/Kconfig
++++ b/lib/efi_loader/Kconfig
+@@ -557,6 +557,15 @@ config EFI_ESRT
+ 	help
+ 	  Enabling this option creates the ESRT UEFI system table.
+ 
++config EFI_QCOM_USB_DEVICE
++	bool "Qualcomm's EFI_USB_DEVICE_PROTOCOL"
++	depends on USB_GADGET && DM_USB_GADGET
++	help
++	  Provide the USB device protocol of Qualcomm's UEFI (as published in
++	  its open-source ABL) on U-Boot's USB gadget stack, for EFI
++	  applications written for Qualcomm's firmware that talk to a host
++	  over USB themselves, such as the HakiOS loader.
++
+ config EFI_ECPT
+ 	bool "Enable the UEFI ECPT generation"
+ 	default y
+diff --git a/lib/efi_loader/Makefile b/lib/efi_loader/Makefile
+index d73ad439..4a39b8b5 100644
+--- a/lib/efi_loader/Makefile
++++ b/lib/efi_loader/Makefile
+@@ -72,6 +72,7 @@ obj-$(CONFIG_EFI_RISCV_BOOT_PROTOCOL) += efi_riscv.o
+ obj-$(CONFIG_EFI_LOAD_FILE2_INITRD) += efi_load_initrd.o
+ obj-$(CONFIG_EFI_SIGNATURE_SUPPORT) += efi_signature.o
+ obj-$(CONFIG_EFI_ECPT) += efi_conformance.o
++obj-$(CONFIG_EFI_QCOM_USB_DEVICE) += efi_qcom_usb.o
+ obj-$(CONFIG_EFI_DEBUG_SUPPORT) += efi_debug_support.o
+ 
+ EFI_VAR_SEED_FILE := $(subst $\",,$(CONFIG_EFI_VAR_SEED_FILE))
+diff --git a/lib/efi_loader/efi_setup.c b/lib/efi_loader/efi_setup.c
+index f302bb62..ab5a9854 100644
+--- a/lib/efi_loader/efi_setup.c
++++ b/lib/efi_loader/efi_setup.c
+@@ -325,6 +325,12 @@ efi_status_t efi_init_obj_list(void)
+ 			goto out;
+ 	}
+ 
++	if (IS_ENABLED(CONFIG_EFI_QCOM_USB_DEVICE)) {
++		ret = efi_qcom_usb_register();
++		if (ret != EFI_SUCCESS)
++			goto out;
++	}
++
+ 	if (IS_ENABLED(CONFIG_EFI_RISCV_BOOT_PROTOCOL)) {
+ 		ret = efi_riscv_register();
+ 		if (ret != EFI_SUCCESS)
