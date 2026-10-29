@@ -9,7 +9,8 @@
  *
  * The interface is the one published in Qualcomm's open-source ABL, QcomModulePkg/Include/Protocol/EFIUsbDevice.h.
  * What is implemented is what a caller of it needs: one configuration, bulk endpoints, high speed. The control endpoint
- * is answered here from the caller's descriptors; the caller sees only its bulk transfers and the cable's state.
+ * is answered here from the caller's descriptors (as USB 2.0, without the caller's BOS: see qusb_setup()); the caller
+ * sees only its bulk transfers and the cable's state.
  *
  * U-Boot's gadget drivers run from polling (dm_usb_gadget_handle_interrupts()), as this protocol does: HandleEvent
  * polls the controller once and returns the oldest event, if there is one.
@@ -19,8 +20,10 @@
 
 #include <dm.h>
 #include <efi_loader.h>
+#include <env.h>
 #include <log.h>
 #include <malloc.h>
+#include <asm/unaligned.h>
 #include <linux/sizes.h>
 #include <linux/usb/ch9.h>
 #include <linux/usb/gadget.h>
@@ -115,10 +118,13 @@ static struct {
 	struct qusb_ep eps[MAX_EPS];
 	int neps;
 	bool started, configured;
+	bool debug;			/* hakios_usb_debug=1: what happens on the bus, on the console */
 	struct qusb_event events[MAX_EVENTS];
 	unsigned int ev_head, ev_tail;
 	struct { void *buf; size_t size; } buffers[MAX_BUFFERS];
 } qusb;
+
+#define qdbg(fmt, ...) do { if (qusb.debug) printf("qusb: " fmt, ##__VA_ARGS__); } while (0)
 
 static void qusb_event(u32 msg, const union efi_qcom_usb_event_data *data)
 {
@@ -128,6 +134,7 @@ static void qusb_event(u32 msg, const union efi_qcom_usb_event_data *data)
 		log_warning("qcom usb: event queue full, an event is lost\n");
 		return;
 	}
+	qdbg("event %u (%08x)\n", msg, (u32)data->raw[0]);
 	qusb.events[qusb.ev_tail].msg = msg;
 	qusb.events[qusb.ev_tail].data = *data;
 	qusb.ev_tail = next;
@@ -164,6 +171,7 @@ static void qusb_complete(struct usb_ep *ep, struct usb_request *req)
 	u64 got = req->actual;
 
 	e->busy = false;
+	qdbg("done %02x status %d actual %u of %u\n", e->address, req->status, req->actual, req->length);
 	if (!(e->address & USB_DIR_IN)) {
 		/* the controller is asked for whole packets; the caller gets no more than it asked for */
 		if (got > e->want)
@@ -208,11 +216,17 @@ static int qusb_take_config(void)
 		e->address = d->bEndpointAddress;
 		memcpy(&e->desc, d, USB_DT_ENDPOINT_SIZE);
 		e->desc.bLength = USB_DT_ENDPOINT_SIZE;
+		/*
+		 * Only the direction: autoconfig ORs the number of the endpoint it picks into the address, and the
+		 * caller's 0x01 with DWC3's ep2out made 0x03, an endpoint the controller does not have (seen on the phone).
+		 */
+		e->desc.bEndpointAddress &= USB_DIR_IN;
 		e->ep = usb_ep_autoconfig(qusb.gadget, &e->desc);
 		if (!e->ep) {
 			log_err("qcom usb: no endpoint for %02x\n", e->address);
 			return -ENODEV;
 		}
+		qdbg("endpoint %02x is %s (%02x)\n", e->address, e->ep->name, e->desc.bEndpointAddress);
 		/* what the host is told is the endpoint the controller really has */
 		d->bEndpointAddress = e->desc.bEndpointAddress;
 		e->ep->driver_data = e;
@@ -242,6 +256,7 @@ static void qusb_disable(void)
 
 static int qusb_set_config(u16 value)
 {
+	qdbg("set configuration %u\n", value);
 	qusb_disable();
 	if (value == 0)
 		return 0;
@@ -250,6 +265,7 @@ static int qusb_set_config(u16 value)
 	for (int i = 0; i < qusb.neps; i++) {
 		int ret = usb_ep_enable(qusb.eps[i].ep, &qusb.eps[i].desc);
 
+		qdbg("enable %02x: %d\n", qusb.eps[i].address, ret);
 		if (ret) {
 			log_err("qcom usb: endpoint %02x not enabled: %d\n", qusb.eps[i].address, ret);
 			return ret;
@@ -283,6 +299,8 @@ static int qusb_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c
 	u8 *buf = req->buf;
 	int value = -EOPNOTSUPP;
 
+	qdbg("setup %02x %02x %04x %04x %04x\n", ctrl->bRequestType, ctrl->bRequest, w_value,
+	     le16_to_cpu(ctrl->wIndex), w_length);
 	if ((ctrl->bRequestType & USB_TYPE_MASK) != USB_TYPE_STANDARD)
 		return -EOPNOTSUPP;
 
@@ -292,6 +310,13 @@ static int qusb_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c
 		case USB_DT_DEVICE:
 			memcpy(buf, qusb.set.device_descriptor, USB_DT_DEVICE_SIZE);
 			buf[7] = gadget->ep0->maxpacket;	/* bMaxPacketSize0 */
+			/*
+			 * USB 2.0 without a BOS, as U-Boot's own gadgets are: the caller's 2.10 and BOS promise Link
+			 * Power Management, which U-Boot's DWC3 does not do. Windows took the promise, put the idle
+			 * link into L1, and the device was gone from the bus three seconds after it came (seen on
+			 * the phone).
+			 */
+			put_unaligned_le16(0x0200, buf + 2);
 			value = USB_DT_DEVICE_SIZE;
 			break;
 		case USB_DT_DEVICE_QUALIFIER:
@@ -308,12 +333,6 @@ static int qusb_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c
 			break;
 		case USB_DT_STRING:
 			value = qusb_string(w_value & 0xff, buf);
-			break;
-		case USB_DT_BOS:
-			if (!qusb.set.bos)
-				break;
-			value = get_unaligned_le16((const u8 *)qusb.set.bos + 2);
-			memcpy(buf, qusb.set.bos, value);
 			break;
 		}
 		break;
@@ -342,6 +361,7 @@ static int qusb_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c
 
 static void qusb_disconnect(struct usb_gadget *gadget)
 {
+	qdbg("disconnect or reset\n");
 	qusb_disable();
 }
 
@@ -396,6 +416,7 @@ static efi_status_t EFIAPI qusb_start_ex(struct efi_qcom_usb_descriptor_set *set
 	if (qusb.started)
 		return EFI_EXIT(EFI_ALREADY_STARTED);
 	qusb.set = *set;
+	qusb.debug = env_get_yesno("hakios_usb_debug") == 1;
 	qusb.ev_head = qusb.ev_tail = 0;
 	ret = udc_device_get_by_index(0, &qusb.udc);
 	if (ret) {
@@ -430,6 +451,7 @@ static efi_status_t EFIAPI qusb_send(u8 endpoint, u64 size, void *buffer)
 	struct usb_request *req;
 	u64 length = size;
 	size_t own;
+	int ret;
 
 	EFI_ENTRY("%02x, %llu, %p", endpoint, size, buffer);
 	e = qusb_find(endpoint);
@@ -463,7 +485,9 @@ static efi_status_t EFIAPI qusb_send(u8 endpoint, u64 size, void *buffer)
 	e->user = buffer;
 	e->want = size;
 	e->busy = true;
-	if (usb_ep_queue(e->ep, req, 0)) {
+	ret = usb_ep_queue(e->ep, req, 0);
+	qdbg("send %02x %llu (%llu): %d\n", endpoint, size, length, ret);
+	if (ret) {
 		e->busy = false;
 		return EFI_EXIT(EFI_DEVICE_ERROR);
 	}
