@@ -19,6 +19,21 @@ if [ -z "$CROSS_COMPILE" ]; then
 	[ -n "$CROSS_COMPILE" ] || { echo "u-boot/build.sh: no AArch64 GCC on PATH (CROSS_COMPILE=...)" >&2; exit 1; }
 fi
 out=$UB/build-$dev
-make -C "$UB" -s O="$out" CROSS_COMPILE="$CROSS_COMPILE" "hakios_${dev}_defconfig"
-make -C "$UB" -s O="$out" CROSS_COMPILE="$CROSS_COMPILE" -j"$(nproc)"
+# On a Mac: U-Boot's makefiles want GNU make 4 (MAKE= one, as gmake or make on PATH: macOS's own is 3.81, which has no
+# `undefine`); scripts/check-local-export is a check only and wants bash 4 (macOS's is 3.2), so it is left out; and the
+# host tools are built without OpenSSL, which macOS does not ship headers for (the FIT signing tools: nothing here signs).
+MAKE=${MAKE:-make}
+extra=()
+if [ "$(uname)" = Darwin ]; then
+	command -v gmake >/dev/null && MAKE=gmake
+	"$MAKE" --version | head -1 | grep -q 'GNU Make [4-9]' ||
+		{ echo "u-boot/build.sh: U-Boot needs GNU make 4 (MAKE=..., or gmake on PATH); this make is: $("$MAKE" --version | head -1)" >&2; exit 1; }
+	extra=(cmd_check_local_export=true NO_SDL=1)
+fi
+"$MAKE" -C "$UB" -s O="$out" CROSS_COMPILE="$CROSS_COMPILE" "${extra[@]}" "hakios_${dev}_defconfig"
+if [ "$(uname)" = Darwin ]; then
+	"$UB/scripts/config" --file "$out/.config" -d TOOLS_LIBCRYPTO -d TOOLS_KWBIMAGE
+	"$MAKE" -C "$UB" -s O="$out" CROSS_COMPILE="$CROSS_COMPILE" "${extra[@]}" olddefconfig
+fi
+"$MAKE" -C "$UB" -s O="$out" CROSS_COMPILE="$CROSS_COMPILE" "${extra[@]}" -j"$(nproc)"
 ls -la "$out/u-boot.bin"
